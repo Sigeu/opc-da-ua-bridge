@@ -8,6 +8,7 @@ from datetime import datetime
 
 import opcua
 from opcua import ua
+from opcua.ua.ua_binary import variant_to_binary
 import OpenOPC
 
 
@@ -61,16 +62,45 @@ DTYPE_MAP = {
     21: "UINT64",
 }
 
+DTYPE_TO_VT = {
+    2: ua.VariantType.Int16,
+    3: ua.VariantType.Int32,
+    4: ua.VariantType.Float,
+    5: ua.VariantType.Double,
+    7: ua.VariantType.DateTime,
+    8: ua.VariantType.String,
+    11: ua.VariantType.Boolean,
+    16: ua.VariantType.SByte,
+    17: ua.VariantType.Byte,
+    18: ua.VariantType.UInt16,
+    19: ua.VariantType.UInt32,
+    20: ua.VariantType.Int64,
+    21: ua.VariantType.UInt64,
+}
+
+DEFAULT_VAL = {
+    ua.VariantType.Float: 0.0,
+    ua.VariantType.Double: 0.0,
+    ua.VariantType.String: '',
+    ua.VariantType.DateTime: datetime.now(),
+    ua.VariantType.ByteString: b'',
+    ua.VariantType.Boolean: False,
+}
+
 LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
 
 
 def DARead(da_client, group_name):
     tags = [tag for tag in da_client.list(flat=True) if tag.startswith(group_name)]
     if not tags:
+        logging.warning(f"DARead: no tags found for group '{group_name}'")
         return {}, {}, {}
 
-    opcua_tagname_list = [tag[tag.rfind('.') + 1:] for tag in tags]
-    values_lst = [(value, timestamp) for name, value, quality, timestamp in da_client.read(tags)]
+    opcua_tagname_list = tags
+    read_result = da_client.read(tags)
+    if not read_result:
+        logging.warning(f"DARead: empty read_result for {len(tags)} tags")
+    values_lst = [(value, timestamp) for name, value, quality, timestamp in read_result]
     access_lst = [acc for name, acc in da_client.properties(tags, id=5)]
     dtypes_lst = [dtype for name, dtype in da_client.properties(tags, id=1)]
 
@@ -109,8 +139,10 @@ def ua_tag_create(obj: opcua.Node, index: int, opcua_tag_dict: dict, access_dict
     }
     for ua_tagname in access_dict.keys():
         if ua_tagname not in opcua_tag_dict.keys():
-            dtype = dtype_mapping.get(str(dtype_dict.get(ua_tagname, 8)), ua.NodeId(ua.ObjectIds.String))
-            new_var = obj.add_variable(index, ua_tagname, val=0, datatype=dtype)
+            dtype_id = dtype_dict.get(ua_tagname, 8)
+            dtype = dtype_mapping.get(str(dtype_id), ua.NodeId(ua.ObjectIds.String))
+            vt = DTYPE_TO_VT.get(dtype_id)
+            new_var = obj.add_variable(index, ua_tagname, val=DEFAULT_VAL.get(vt, 0), varianttype=vt, datatype=dtype)
             if access_dict[ua_tagname] in ('Read/Write', 'Write'):
                 new_var.set_writable()
                 subscription.subscribe_data_change(new_var)
@@ -131,8 +163,7 @@ class OPCUAHandler:
     def datachange_notification(self, node: opcua.Node, val, data):
         for ua_tagname, tag in list(self.opcua_tags.items()):
             if tag == node:
-                da_tagname = f'{self.group_name}.{ua_tagname}'
-                self.queue.put((ua_tagname, da_tagname, val))
+                self.queue.put((ua_tagname, ua_tagname, val))
 
 
 def UA2DA_Write(UAHandler: OPCUAHandler, da_client: OpenOPC.client, ua_last_write: dict, da_last_read: dict):
@@ -147,21 +178,42 @@ def UA2DA_Write(UAHandler: OPCUAHandler, da_client: OpenOPC.client, ua_last_writ
             logging.warning(f"UA->DA write error: {e}")
 
 
-def DA2UAWrite(ua_r_and_rw: dict, values, ua_last_write: dict, da_last_read: dict):
+def DA2UAWrite(ua_r_and_rw: dict, values, ua_last_write: dict, da_last_read: dict, dtypes: dict):
     for ua_tagname, tag in ua_r_and_rw.items():
         if ua_tagname not in values:
             continue
         try:
+            da_val = values[ua_tagname][0]
+            if da_val is None:
+                da_last_read.pop(ua_tagname, None)
+                continue
+            dtype_id = dtypes.get(ua_tagname, 8)
+            vt = DTYPE_TO_VT.get(dtype_id)
+            if vt is not None:
+                if vt in (ua.VariantType.Float, ua.VariantType.Double):
+                    da_val = float(da_val)
+                elif vt in (ua.VariantType.Int16, ua.VariantType.Int32, ua.VariantType.Int64,
+                            ua.VariantType.UInt16, ua.VariantType.UInt32, ua.VariantType.UInt64,
+                            ua.VariantType.Byte, ua.VariantType.SByte):
+                    da_val = int(da_val)
+                variant = ua.Variant(da_val, vt)
+                try:
+                    variant_to_binary(variant)
+                except Exception as ve:
+                    logging.debug(f"Variant encoding failed for {ua_tagname}: value={da_val!r} vt={vt} - {ve}")
+                    continue
+            else:
+                variant = da_val
             if ua_tagname in ua_last_write.keys():
-                if values[ua_tagname][0] != ua_last_write[ua_tagname]:
+                if da_val != ua_last_write[ua_tagname]:
                     timestamp = datetime.fromisoformat(values[ua_tagname][1])
-                    tag.set_value(ua.DataValue(variant=values[ua_tagname][0],
+                    tag.set_value(ua.DataValue(variant=variant,
                                                serverTimestamp=datetime.now(),
                                                sourceTimestamp=timestamp))
-                    logging.info(f"WRITE DA -> UA: {ua_tagname} = {values[ua_tagname][0]}")
+                    logging.info(f"WRITE DA -> UA: {ua_tagname} = {da_val}")
             elif da_last_read.get(ua_tagname, None) != values[ua_tagname][0]:
                 timestamp = datetime.fromisoformat(values[ua_tagname][1])
-                tag.set_value(ua.DataValue(variant=values[ua_tagname][0],
+                tag.set_value(ua.DataValue(variant=variant,
                                            serverTimestamp=datetime.now(),
                                            sourceTimestamp=timestamp))
                 logging.info(f"WRITE DA -> UA: {ua_tagname} = {values[ua_tagname][0]}")
@@ -206,13 +258,15 @@ def main():
         node_id = f"ns=2;i={i + 2}"
         dtype_name = DTYPE_MAP.get(dtype_id, f"UNKNOWN({dtype_id})")
         entry = {
-            "NodeId": node_id,
-            "TagName": da_tag,
-            "DataType": dtype_name,
+            "group": CONFIG["group_name"],
+            "name": da_tag,
+            "address": node_id,
+            "attribute": "Read",
+            "type": dtype_name,
         }
         if has_quality:
             q = str(qualities.get(da_tag, ""))
-            entry["Health"] = "good" if q.lower() == "good" else "bad"
+            entry["health"] = "good" if q.lower() == "good" else "bad"
         tag_infos.append(entry)
         logging.info(f"  {node_id:>12}  {dtype_name:>6}  {da_tag}")
 
@@ -240,7 +294,7 @@ def main():
             values, accesss, dtypes = DARead(da_client, CONFIG["group_name"])
             if values:
                 ua_tag_create(obj, index, ua_tag_dict, accesss, subscription, dtypes, ua_r_and_rw)
-                DA2UAWrite(ua_r_and_rw, values, ua_last_write, da_last_read)
+                DA2UAWrite(ua_r_and_rw, values, ua_last_write, da_last_read, dtypes)
     except KeyboardInterrupt:
         logging.info("Shutting down bridge...")
     finally:
