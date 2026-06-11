@@ -129,7 +129,7 @@ class OPCUAHandler:
         self.queue = queue.Queue()
 
     def datachange_notification(self, node: opcua.Node, val, data):
-        for ua_tagname, tag in self.opcua_tags.items():
+        for ua_tagname, tag in list(self.opcua_tags.items()):
             if tag == node:
                 da_tagname = f'{self.group_name}.{ua_tagname}'
                 self.queue.put((ua_tagname, da_tagname, val))
