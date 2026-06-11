@@ -1,0 +1,2 @@
+@echo off
+regsvr32 gbda_aut.dll -u
